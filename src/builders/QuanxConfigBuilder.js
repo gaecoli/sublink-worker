@@ -1,0 +1,457 @@
+import { BaseConfigBuilder } from './BaseConfigBuilder.js';
+import { groupProxiesByCountry } from '../utils.js';
+import { QUANX_CONFIG, SURGE_SITE_RULE_SET_BASEURL, SURGE_IP_RULE_SET_BASEURL, generateRules, DIRECT_DEFAULT_RULES } from '../config/index.js';
+import { addProxyWithDedup } from './helpers/proxyHelpers.js';
+import { buildSelectorMembers, buildNodeSelectMembers, buildCustomRuleMembers, uniqueNames } from './helpers/groupBuilder.js';
+
+// Syntax reference: https://github.com/crossutility/Quantumult-X/blob/master/sample.conf
+
+const SS_METHODS = new Set([
+    'none', 'rc4-md5', 'rc4-md5-6', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+    'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'bf-cfb', 'cast5-cfb', 'des-cfb', 'rc2-cfb',
+    'salsa20', 'chacha20', 'chacha20-ietf', 'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+    'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+    '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm'
+]);
+
+const VMESS_METHODS = new Set(['none', 'aes-128-gcm', 'chacha20-poly1305']);
+
+const BUILTIN_POLICIES = { DIRECT: 'direct', REJECT: 'reject' };
+
+const LATENCY_PARAMS = 'check-interval=600, alive-checking=false, tolerance=0';
+
+const REMOTE_UPDATE_INTERVAL = 86400;
+
+// QX splits lines on commas and key=value pairs on '=' with no escaping, so names must avoid both
+export function sanitizeQuanxName(name) {
+    return String(name ?? '').replace(/[\r\n]+/g, ' ').replace(/,/g, '，').replace(/=/g, '＝').trim();
+}
+
+class UnsupportedProxyError extends Error { }
+
+function unsupported(reason) {
+    throw new UnsupportedProxyError(reason);
+}
+
+// A raw comma would silently shift every following parameter, so refuse instead
+function param(key, value) {
+    const str = String(value);
+    if (/[,\r\n]/.test(str)) {
+        unsupported(`${key} contains a comma or newline`);
+    }
+    return `${key}=${str}`;
+}
+
+function formatServer(server, port) {
+    if (!server || !port) unsupported('missing server or port');
+    const host = String(server).includes(':') && !String(server).startsWith('[') ? `[${server}]` : server;
+    return `${host}:${port}`;
+}
+
+function firstValue(value) {
+    return Array.isArray(value) ? value[0] : value;
+}
+
+function getHostHeader(transport) {
+    const headers = transport?.headers;
+    if (!headers || typeof headers !== 'object') return undefined;
+    return firstValue(headers.host ?? headers.Host);
+}
+
+function getPath(transport) {
+    return firstValue(transport?.path);
+}
+
+function isTlsEnabled(proxy) {
+    return !!proxy.tls?.enabled;
+}
+
+function tlsCommonParams(tls) {
+    const reality = tls?.reality;
+    if (reality?.enabled) {
+        // Reality authenticates the server itself; the official sample sets no tls-verification here
+        if (!reality.public_key) unsupported('reality without public key');
+        const parts = [param('reality-base64-pubkey', reality.public_key)];
+        if (reality.short_id) parts.push(param('reality-hex-shortid', reality.short_id));
+        return parts;
+    }
+    return [param('tls-verification', !tls?.insecure)];
+}
+
+function udpRelay(proxy) {
+    // Same default as the Clash builder: enabled unless the source explicitly disables it
+    return param('udp-relay', proxy.udp !== false);
+}
+
+// Shared by vmess/vless: QX expresses transport + TLS through a single obfs field
+function v2rayTransportParams(proxy) {
+    const transport = proxy.transport;
+    const type = transport?.type || 'tcp';
+    const tls = isTlsEnabled(proxy);
+    const sni = proxy.tls?.server_name;
+    const parts = [];
+    let obfsHost;
+
+    if (type === 'tcp') {
+        if (tls) {
+            parts.push('obfs=over-tls');
+            obfsHost = sni;
+            if (obfsHost) parts.push(param('obfs-host', obfsHost));
+        }
+    } else if (type === 'ws') {
+        parts.push(tls ? 'obfs=wss' : 'obfs=ws');
+        obfsHost = getHostHeader(transport) || sni;
+        if (obfsHost) parts.push(param('obfs-host', obfsHost));
+        parts.push(param('obfs-uri', getPath(transport) || '/'));
+    } else if (type === 'http') {
+        if (tls) unsupported('http obfs over tls');
+        parts.push('obfs=http');
+        const host = getHostHeader(transport);
+        if (host) parts.push(param('obfs-host', host));
+        parts.push(param('obfs-uri', getPath(transport) || '/'));
+    } else {
+        unsupported(`transport ${type}`);
+    }
+
+    if (tls) {
+        // obfs-host doubles as SNI for vmess/vless; only override when the real SNI differs
+        if (sni && sni !== obfsHost) parts.push(param('tls-host', sni));
+        parts.push(...tlsCommonParams(proxy.tls));
+    }
+    return parts;
+}
+
+function convertShadowsocks(proxy) {
+    const method = proxy.method || 'none';
+    if (!SS_METHODS.has(method)) unsupported(`cipher ${method}`);
+    const parts = [
+        `shadowsocks=${formatServer(proxy.server, proxy.server_port)}`,
+        param('method', method),
+        param('password', proxy.password ?? '')
+    ];
+
+    if (proxy.plugin) {
+        const opts = proxy.plugin_opts || {};
+        if (proxy.plugin === 'obfs' || proxy.plugin === 'obfs-local') {
+            const mode = opts.mode || 'http';
+            if (mode !== 'http' && mode !== 'tls') unsupported(`obfs mode ${mode}`);
+            parts.push(param('obfs', mode));
+            if (opts.host) parts.push(param('obfs-host', opts.host));
+            if (mode === 'http' && opts.path) parts.push(param('obfs-uri', opts.path));
+        } else if (proxy.plugin === 'v2ray-plugin' && (!opts.mode || opts.mode === 'websocket')) {
+            const tls = opts.tls === true || opts.tls === 'true';
+            parts.push(tls ? 'obfs=wss' : 'obfs=ws');
+            if (opts.host) parts.push(param('obfs-host', opts.host));
+            parts.push(param('obfs-uri', opts.path || '/'));
+        } else {
+            unsupported(`plugin ${proxy.plugin}`);
+        }
+    }
+
+    parts.push(udpRelay(proxy));
+    return parts;
+}
+
+function convertVmess(proxy) {
+    const security = proxy.security || 'auto';
+    const method = security === 'zero' ? 'none' : (VMESS_METHODS.has(security) ? security : 'chacha20-poly1305');
+    return [
+        `vmess=${formatServer(proxy.server, proxy.server_port)}`,
+        param('method', method),
+        param('password', proxy.uuid ?? ''),
+        ...v2rayTransportParams(proxy),
+        param('aead', !(Number(proxy.alter_id) > 0)),
+        udpRelay(proxy)
+    ];
+}
+
+function convertVless(proxy) {
+    const parts = [
+        `vless=${formatServer(proxy.server, proxy.server_port)}`,
+        'method=none',
+        param('password', proxy.uuid ?? ''),
+        ...v2rayTransportParams(proxy)
+    ];
+    if (proxy.flow) {
+        if (proxy.flow !== 'xtls-rprx-vision') unsupported(`flow ${proxy.flow}`);
+        if (!isTlsEnabled(proxy)) unsupported('vision flow without tls');
+        parts.push(param('vless-flow', proxy.flow));
+    }
+    parts.push(udpRelay(proxy));
+    return parts;
+}
+
+function convertTrojan(proxy) {
+    const parts = [
+        `trojan=${formatServer(proxy.server, proxy.server_port)}`,
+        param('password', proxy.password ?? '')
+    ];
+    const type = proxy.transport?.type || 'tcp';
+    const sni = proxy.tls?.server_name;
+    if (proxy.tls && proxy.tls.enabled === false) unsupported('trojan without tls');
+
+    if (type === 'ws') {
+        // QX only supports websocket over tls for trojan and takes SNI from obfs-host
+        parts.push('obfs=wss');
+        const host = getHostHeader(proxy.transport) || sni;
+        if (host) parts.push(param('obfs-host', host));
+        parts.push(param('obfs-uri', getPath(proxy.transport) || '/'));
+    } else if (type === 'tcp') {
+        parts.push('over-tls=true');
+        if (sni) parts.push(param('tls-host', sni));
+    } else {
+        unsupported(`transport ${type}`);
+    }
+
+    parts.push(...tlsCommonParams(proxy.tls));
+    parts.push(udpRelay(proxy));
+    return parts;
+}
+
+function convertAnytls(proxy) {
+    const parts = [
+        `anytls=${formatServer(proxy.server, proxy.server_port)}`,
+        param('password', proxy.password ?? ''),
+        'over-tls=true'
+    ];
+    if (proxy.tls?.server_name) parts.push(param('tls-host', proxy.tls.server_name));
+    parts.push(...tlsCommonParams(proxy.tls));
+    parts.push(udpRelay(proxy));
+    return parts;
+}
+
+const CONVERTERS = {
+    shadowsocks: convertShadowsocks,
+    vmess: convertVmess,
+    vless: convertVless,
+    trojan: convertTrojan,
+    anytls: convertAnytls
+};
+
+export function formatQuanxProxy(proxy) {
+    return `${proxy.body}, tag=${proxy.tag}`;
+}
+
+export class QuanxConfigBuilder extends BaseConfigBuilder {
+    constructor(inputString, selectedRules, customRules, baseConfig, lang, userAgent, groupByCountry, includeAutoSelect = true) {
+        super(inputString, baseConfig ?? QUANX_CONFIG, lang, userAgent, groupByCountry, includeAutoSelect);
+        this.selectedRules = selectedRules;
+        this.customRules = customRules;
+        this.countryGroupNames = [];
+        this.manualGroupName = null;
+        this.unsupportedProxies = [];
+        this.config.proxies = [];
+        this.config.policies = [];
+    }
+
+    // Overrides from Clash/Sing-Box/Surge subscriptions use foreign keys and group syntax
+    // that would corrupt a QX profile; only their proxies are kept.
+    applyConfigOverrides() { }
+
+    getProxies() {
+        return this.config.proxies;
+    }
+
+    getProxyName(proxy) {
+        return proxy.tag;
+    }
+
+    // Proxies are kept as { tag, body } so dedup/renaming only touches the tag
+    convertProxy(proxy) {
+        const tag = sanitizeQuanxName(proxy.tag);
+        const converter = CONVERTERS[proxy.type];
+        try {
+            if (!converter) unsupported(`type ${proxy.type}`);
+            if (!tag) unsupported('empty name');
+            return { tag, body: converter(proxy).join(', ') };
+        } catch (error) {
+            // One malformed node must not break the whole profile
+            const reason = error instanceof UnsupportedProxyError ? error.message : 'invalid proxy';
+            this.unsupportedProxies.push(`${tag || proxy.type} - ${reason}`);
+            return null;
+        }
+    }
+
+    addProxyToConfig(proxy) {
+        addProxyWithDedup(this.config.proxies, proxy, {
+            isSame: (a, b) => a.body === b.body
+        });
+    }
+
+    hasPolicy(name) {
+        return this.config.policies.some(policy => policy.name === name);
+    }
+
+    addPolicy(name, type, members) {
+        const policyName = sanitizeQuanxName(name);
+        if (!policyName || this.hasPolicy(policyName)) return;
+        this.config.policies.push({ name: policyName, type, members: uniqueNames(members) });
+    }
+
+    buildSelectorOptions(proxyList) {
+        return buildSelectorMembers({
+            proxyList,
+            translator: this.t,
+            groupByCountry: this.groupByCountry,
+            manualGroupName: this.manualGroupName,
+            countryGroupNames: this.countryGroupNames,
+            includeAutoSelect: this.includeAutoSelect
+        });
+    }
+
+    addAutoSelectGroup(proxyList) {
+        if (!this.includeAutoSelect) return;
+        this.addPolicy(this.t('outboundNames.Auto Select'), 'url-latency-benchmark', proxyList);
+    }
+
+    addNodeSelectGroup(proxyList) {
+        this.addPolicy(this.t('outboundNames.Node Select'), 'static', buildNodeSelectMembers({
+            proxyList,
+            translator: this.t,
+            includeAutoSelect: this.includeAutoSelect
+        }));
+    }
+
+    addOutboundGroups(outbounds, proxyList) {
+        outbounds.forEach(outbound => {
+            if (outbound === 'Node Select') return;
+            let options = this.buildSelectorOptions(proxyList);
+            if (DIRECT_DEFAULT_RULES.has(outbound)) {
+                options = ['DIRECT', ...options.filter(p => p !== 'DIRECT')];
+            }
+            this.addPolicy(this.t(`outboundNames.${outbound}`), 'static', options);
+        });
+    }
+
+    addCustomRuleGroups(proxyList) {
+        if (!Array.isArray(this.customRules)) return;
+        this.customRules.forEach(rule => {
+            this.addPolicy(rule.name, 'static', buildCustomRuleMembers({
+                proxyList,
+                translator: this.t,
+                manualGroupName: this.manualGroupName,
+                includeAutoSelect: this.includeAutoSelect
+            }));
+        });
+    }
+
+    addFallBackGroup(proxyList) {
+        this.addPolicy(this.t('outboundNames.Fall Back'), 'static', this.buildSelectorOptions(proxyList));
+    }
+
+    addCountryGroups() {
+        const proxies = this.getProxies();
+        const countryGroups = groupProxiesByCountry(proxies, { getName: proxy => proxy.tag });
+        const manualProxyNames = proxies.map(proxy => proxy.tag);
+        const manualGroupName = manualProxyNames.length > 0 ? sanitizeQuanxName(this.t('outboundNames.Manual Switch')) : null;
+        if (manualGroupName) {
+            this.addPolicy(manualGroupName, 'static', manualProxyNames);
+        }
+
+        const countryGroupNames = Object.keys(countryGroups)
+            .sort((a, b) => a.localeCompare(b))
+            .map(country => {
+                const { emoji, name, proxies: members } = countryGroups[country];
+                const groupName = sanitizeQuanxName(`${emoji} ${name}`);
+                this.addPolicy(groupName, 'url-latency-benchmark', members);
+                return groupName;
+            });
+
+        const nodeSelectName = sanitizeQuanxName(this.t('outboundNames.Node Select'));
+        const nodeSelect = this.config.policies.find(policy => policy.name === nodeSelectName);
+        if (nodeSelect) {
+            nodeSelect.members = uniqueNames(buildNodeSelectMembers({
+                proxyList: [],
+                translator: this.t,
+                groupByCountry: true,
+                manualGroupName,
+                countryGroupNames,
+                includeAutoSelect: this.includeAutoSelect
+            }));
+        }
+        this.countryGroupNames = countryGroupNames;
+        this.manualGroupName = manualGroupName;
+    }
+
+    formatPolicy({ name, type, members }) {
+        const mapped = members.map(member => BUILTIN_POLICIES[member] || sanitizeQuanxName(member));
+        // QX rejects empty policies and latency tests need real servers
+        if (mapped.length === 0) {
+            return `static=${name}, direct`;
+        }
+        if (type === 'url-latency-benchmark') {
+            return `url-latency-benchmark=${name}, ${mapped.join(', ')}, ${LATENCY_PARAMS}`;
+        }
+        return `static=${name}, ${mapped.join(', ')}`;
+    }
+
+    policyName(outbound) {
+        return sanitizeQuanxName(this.t(`outboundNames.${outbound}`));
+    }
+
+    buildRemoteFilters(rules) {
+        const lines = [];
+        const usedTags = new Set();
+        const add = (url, id, outbound) => {
+            const policy = this.policyName(outbound);
+            let tag = sanitizeQuanxName(`${id} - ${policy}`);
+            for (let i = 2; usedTags.has(tag); i++) tag = sanitizeQuanxName(`${id} - ${policy} ${i}`);
+            usedTags.add(tag);
+            lines.push(`${url}, tag=${tag}, force-policy=${policy}, update-interval=${REMOTE_UPDATE_INTERVAL}, opt-parser=true, enabled=true`);
+        };
+        // Domain lists first so IP lists (which need DNS) are evaluated last
+        rules.forEach(rule => (rule.site_rules || []).filter(Boolean).forEach(site => {
+            add(`${SURGE_SITE_RULE_SET_BASEURL}${site}.conf`, `geosite:${site}`, rule.outbound);
+        }));
+        rules.forEach(rule => (rule.ip_rules || []).filter(Boolean).forEach(ip => {
+            add(`${SURGE_IP_RULE_SET_BASEURL}${ip}.txt`, `geoip:${ip}`, rule.outbound);
+        }));
+        return lines;
+    }
+
+    buildLocalFilters(rules) {
+        const lines = [];
+        const push = (type, value, outbound) => {
+            const str = typeof value === 'string' ? value.trim() : '';
+            if (!str || /[,\s]/.test(str)) return;
+            lines.push(`${type}, ${str}, ${this.policyName(outbound)}`);
+        };
+        rules.forEach(rule => (rule.domain_suffix || []).forEach(v => push('host-suffix', v, rule.outbound)));
+        rules.forEach(rule => (rule.domain_keyword || []).forEach(v => push('host-keyword', v, rule.outbound)));
+        rules.forEach(rule => (rule.ip_cidr || []).forEach(v => {
+            push(typeof v === 'string' && v.includes(':') ? 'ip6-cidr' : 'ip-cidr', v, rule.outbound);
+        }));
+        rules.forEach(rule => (rule.src_ip_cidr || []).forEach(v => {
+            if (typeof v === 'string' && v.trim()) {
+                lines.push(`# source IP rules are not supported by Quantumult X, skipped: ${v.trim().replace(/[\r\n]+/g, '')}`);
+            }
+        }));
+        lines.push(`final, ${this.policyName('Fall Back')}`);
+        return lines;
+    }
+
+    formatConfig() {
+        // generateRules reverses customRules in place; formatConfig runs twice per request
+        const rules = generateRules(this.selectedRules, Array.isArray(this.customRules) ? [...this.customRules] : []);
+        const general = this.config.general || {};
+        const dns = Array.isArray(this.config.dns) ? this.config.dns : [];
+
+        const sections = [
+            ['[general]', Object.entries(general).map(([key, value]) => `${key} = ${value}`)],
+            ['[dns]', dns],
+            ['[policy]', this.config.policies.map(policy => this.formatPolicy(policy))],
+            ['[server_remote]', []],
+            ['[filter_remote]', this.buildRemoteFilters(rules)],
+            ['[rewrite_remote]', []],
+            ['[server_local]', [
+                ...this.config.proxies.map(formatQuanxProxy),
+                ...this.unsupportedProxies.map(item => `# Unsupported by Quantumult X: ${item}`)
+            ]],
+            ['[filter_local]', this.buildLocalFilters(rules)],
+            ['[rewrite_local]', []],
+            ['[mitm]', []]
+        ];
+
+        return sections.map(([header, lines]) => [header, ...lines].join('\n')).join('\n\n') + '\n';
+    }
+}

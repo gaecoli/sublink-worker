@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-Sublink Worker 是多平台代理订阅转换器：将各类协议（ShadowSocks/VMess/VLESS/Hysteria2/Trojan/TUIC）转为客户端配置（Sing-Box/Clash/Xray/Surge）。同一份代码跑在 Cloudflare Workers / Node.js / Vercel / Docker 上。技术栈：Hono（Web/JSX SSR）+ Vitest + Wrangler + esbuild + ioredis。
+Sublink Worker 是多平台代理订阅转换器：将各类协议（ShadowSocks/VMess/VLESS/Hysteria2/Trojan/TUIC）转为客户端配置（Sing-Box/Clash/Xray/Surge/Quantumult X）。同一份代码跑在 Cloudflare Workers / Node.js / Vercel / Docker 上。技术栈：Hono（Web/JSX SSR）+ Vitest + Wrangler + esbuild + ioredis。
 
 ## 常用命令
 
@@ -55,9 +55,11 @@ Sublink Worker 是多平台代理订阅转换器：将各类协议（ShadowSocks
 
 **新增协议**：在 `src/parsers/protocols/` 加 parser，并在 `ProxyParser.js` 的 `protocolParsers` map 注册。
 
-**Builder 模式**：`SingboxConfigBuilder` / `ClashConfigBuilder` / `SurgeConfigBuilder` 都继承 `BaseConfigBuilder`。子类必须实现：`getProxies()`、`getProxyName(proxy)`、`convertProxy(proxy)`、`addProxyToConfig(proxy)`、`addAutoSelectGroup(list)`、`addNodeSelectGroup(list)`、`addOutboundGroups(outbounds, list)`、`addCustomRuleGroups(list)`、`addFallBackGroup(list)`、`addCountryGroups()`、`formatConfig()`。
+**Builder 模式**：`SingboxConfigBuilder` / `ClashConfigBuilder` / `SurgeConfigBuilder` / `QuanxConfigBuilder` 都继承 `BaseConfigBuilder`。子类必须实现：`getProxies()`、`getProxyName(proxy)`、`convertProxy(proxy)`、`addProxyToConfig(proxy)`、`addAutoSelectGroup(list)`、`addNodeSelectGroup(list)`、`addOutboundGroups(outbounds, list)`、`addCustomRuleGroups(list)`、`addFallBackGroup(list)`、`addCountryGroups()`、`formatConfig()`。
 
 **Config Override**：订阅含完整配置时，`applyConfigOverrides()` 合并非代理字段到 base config；blacklist（proxies、rules、rule-providers）永远不被覆盖；Clash `proxy-groups` 可被订阅覆盖以保留用户分组结构。
+
+QuanX（`/quanx`，短链前缀 `q`）：不支持 hysteria2/tuic/grpc 等，节点输出为注释；远程规则复用 Surge 规则源，依赖 `resource_parser_url` + `opt-parser=true` 在设备端转换；不接受订阅的 config override，且不向上游转发 QuanX UA。
 
 国家分组逻辑在 `src/utils.js#groupProxiesByCountry`。
 

@@ -9,6 +9,7 @@ import { UpdateChecker } from '../components/UpdateChecker.jsx';
 import { SingboxConfigBuilder } from '../builders/SingboxConfigBuilder.js';
 import { ClashConfigBuilder } from '../builders/ClashConfigBuilder.js';
 import { SurgeConfigBuilder } from '../builders/SurgeConfigBuilder.js';
+import { QuanxConfigBuilder } from '../builders/QuanxConfigBuilder.js';
 import { createTranslator, resolveLanguage } from '../i18n/index.js';
 import { encodeBase64, tryDecodeSubscriptionLines } from '../utils.js';
 import { APP_NAME, APP_SUBTITLE } from '../constants.js';
@@ -217,6 +218,44 @@ export function createApp(bindings = {}) {
         }
     });
 
+    app.get('/quanx', async (c) => {
+        try {
+            const config = c.req.query('config');
+            if (!config) {
+                return c.text('Missing config parameter', 400);
+            }
+
+            const selectedRules = parseSelectedRules(c.req.query('selectedRules'));
+            const customRules = parseJsonArray(c.req.query('customRules'));
+            // Never forward Quantumult X's own UA upstream: providers would answer with QX-native
+            // node lines, which this project does not parse.
+            const ua = c.req.query('ua') || DEFAULT_USER_AGENT;
+            const groupByCountry = parseBooleanFlag(c.req.query('group_by_country'));
+            const includeAutoSelect = c.req.query('include_auto_select') !== 'false';
+            const lang = c.get('lang');
+
+            const builder = new QuanxConfigBuilder(
+                config,
+                selectedRules,
+                customRules,
+                undefined,
+                lang,
+                ua,
+                groupByCountry,
+                includeAutoSelect
+            );
+            await builder.build();
+
+            const userinfo = builder.getSubscriptionUserinfo();
+            if (userinfo) {
+                c.header('subscription-userinfo', userinfo);
+            }
+            return c.text(builder.formatConfig());
+        } catch (error) {
+            return handleError(c, error, runtime.logger);
+        }
+    });
+
     app.get('/subconverter', (c) => {
         try {
             const rawSelectedRules = c.req.query('selectedRules');
@@ -350,6 +389,7 @@ export function createApp(bindings = {}) {
     app.get('/b/:code', redirectHandler('singbox'));
     app.get('/c/:code', redirectHandler('clash'));
     app.get('/x/:code', redirectHandler('xray'));
+    app.get('/q/:code', redirectHandler('quanx'));
 
     app.post('/config', async (c) => {
         try {
@@ -382,13 +422,13 @@ export function createApp(bindings = {}) {
 
             const prefix = pathParts[1];
             const shortCode = pathParts[2];
-            if (!['b', 'c', 'x', 's'].includes(prefix)) return c.text(t('invalidShortUrl'), 400);
+            if (!['b', 'c', 'x', 's', 'q'].includes(prefix)) return c.text(t('invalidShortUrl'), 400);
 
             const shortLinks = requireShortLinkService(services.shortLinks);
             const originalParam = await shortLinks.resolveShortCode(shortCode);
             if (!originalParam) return c.text(t('shortUrlNotFound'), 404);
 
-            const mapping = { b: 'singbox', c: 'clash', x: 'xray', s: 'surge' };
+            const mapping = { b: 'singbox', c: 'clash', x: 'xray', s: 'surge', q: 'quanx' };
             const originalUrl = `${urlObj.origin}/${mapping[prefix]}${originalParam}`;
             return c.json({ originalUrl });
         } catch (error) {
