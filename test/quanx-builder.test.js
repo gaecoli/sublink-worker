@@ -190,6 +190,13 @@ describe('QuanxConfigBuilder', () => {
         expect(section(config, 'filter_remote')[0]).toContain('force-policy=Work.Proxy,');
     });
 
+    it('drops rules of a nameless custom rule instead of emitting a policy-less line', async () => {
+        const config = await build(INPUT, { customRules: [{ name: '', domain_suffix: 'x.com', site: 'github' }] });
+        expect(section(config, 'filter_local')).not.toContain('host-suffix, x.com, ');
+        section(config, 'filter_local').forEach(line => expect(line).not.toMatch(/,\s*$/));
+        expect(section(config, 'filter_remote').join('\n')).not.toContain('github.conf');
+    });
+
     it('never yields an empty policy when no node is supported', async () => {
         const policies = section(await build('hysteria2://pw@hy.example.com:8443#Only-HY2'), 'policy');
         expect(policies).toContain('static=⚡ Auto Select, direct');

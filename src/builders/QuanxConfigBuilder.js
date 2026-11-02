@@ -451,7 +451,7 @@ export class QuanxConfigBuilder extends BaseConfigBuilder {
         const rules = generateRules(this.selectedRules, [...customRules]).map((rule, index) => ({
             ...rule,
             policy: index < customRules.length ? sanitizeQuanxName(rule.outbound) : this.policyName(rule.outbound)
-        }));
+        })).filter(rule => rule.policy); // a nameless custom rule has no policy to point at
         const general = this.config.general || {};
         const dns = Array.isArray(this.config.dns) ? this.config.dns : [];
 
