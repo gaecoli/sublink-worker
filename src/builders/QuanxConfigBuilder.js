@@ -3,6 +3,7 @@ import { groupProxiesByCountry } from '../utils.js';
 import { QUANX_CONFIG, SURGE_SITE_RULE_SET_BASEURL, SURGE_IP_RULE_SET_BASEURL, generateRules, DIRECT_DEFAULT_RULES } from '../config/index.js';
 import { addProxyWithDedup } from './helpers/proxyHelpers.js';
 import { buildSelectorMembers, buildNodeSelectMembers, buildCustomRuleMembers, uniqueNames } from './helpers/groupBuilder.js';
+import { parsePluginString } from '../parsers/protocols/shadowsocksParser.js';
 
 // Syntax reference: https://github.com/crossutility/Quantumult-X/blob/master/sample.conf
 
@@ -44,6 +45,9 @@ function param(key, value) {
 
 function formatServer(server, port) {
     if (!server || !port) unsupported('missing server or port');
+    // Subscription data is untrusted: a delimiter here would split or inject config lines
+    if (/[,\s]/.test(String(server))) unsupported('server contains a delimiter');
+    if (!/^\d+$/.test(String(port))) unsupported('invalid port');
     const host = String(server).includes(':') && !String(server).startsWith('[') ? `[${server}]` : server;
     return `${host}:${port}`;
 }
@@ -56,6 +60,19 @@ function getHostHeader(transport) {
     const headers = transport?.headers;
     if (!headers || typeof headers !== 'object') return undefined;
     return firstValue(headers.host ?? headers.Host);
+}
+
+// QX uses obfs-host as both the TLS SNI and the HTTP Host for wss, so it cannot express a mismatch
+function wssHost(transport, sni) {
+    const host = getHostHeader(transport);
+    if (host && sni && host !== sni) unsupported('ws host differs from tls sni');
+    return host || sni;
+}
+
+// Sing-Box keeps SIP003 plugin_opts as a "k=v;flag" string, other sources give an object
+function normalizePluginOpts(opts) {
+    if (typeof opts === 'string') return parsePluginString(`plugin;${opts}`)?.plugin_opts || {};
+    return opts && typeof opts === 'object' ? opts : {};
 }
 
 function getPath(transport) {
@@ -90,18 +107,16 @@ function v2rayTransportParams(proxy) {
     const tls = isTlsEnabled(proxy);
     const sni = proxy.tls?.server_name;
     const parts = [];
-    let obfsHost;
 
     if (type === 'tcp') {
         if (tls) {
             parts.push('obfs=over-tls');
-            obfsHost = sni;
-            if (obfsHost) parts.push(param('obfs-host', obfsHost));
+            if (sni) parts.push(param('obfs-host', sni));
         }
     } else if (type === 'ws') {
         parts.push(tls ? 'obfs=wss' : 'obfs=ws');
-        obfsHost = getHostHeader(transport) || sni;
-        if (obfsHost) parts.push(param('obfs-host', obfsHost));
+        const host = tls ? wssHost(transport, sni) : getHostHeader(transport);
+        if (host) parts.push(param('obfs-host', host));
         parts.push(param('obfs-uri', getPath(transport) || '/'));
     } else if (type === 'http') {
         if (tls) unsupported('http obfs over tls');
@@ -114,8 +129,6 @@ function v2rayTransportParams(proxy) {
     }
 
     if (tls) {
-        // obfs-host doubles as SNI for vmess/vless; only override when the real SNI differs
-        if (sni && sni !== obfsHost) parts.push(param('tls-host', sni));
         parts.push(...tlsCommonParams(proxy.tls));
     }
     return parts;
@@ -131,7 +144,7 @@ function convertShadowsocks(proxy) {
     ];
 
     if (proxy.plugin) {
-        const opts = proxy.plugin_opts || {};
+        const opts = normalizePluginOpts(proxy.plugin_opts);
         if (proxy.plugin === 'obfs' || proxy.plugin === 'obfs-local') {
             const mode = opts.mode || 'http';
             if (mode !== 'http' && mode !== 'tls') unsupported(`obfs mode ${mode}`);
@@ -193,7 +206,7 @@ function convertTrojan(proxy) {
     if (type === 'ws') {
         // QX only supports websocket over tls for trojan and takes SNI from obfs-host
         parts.push('obfs=wss');
-        const host = getHostHeader(proxy.transport) || sni;
+        const host = wssHost(proxy.transport, sni);
         if (host) parts.push(param('obfs-host', host));
         parts.push(param('obfs-uri', getPath(proxy.transport) || '/'));
     } else if (type === 'tcp') {
@@ -267,7 +280,8 @@ export class QuanxConfigBuilder extends BaseConfigBuilder {
         } catch (error) {
             // One malformed node must not break the whole profile
             const reason = error instanceof UnsupportedProxyError ? error.message : 'invalid proxy';
-            this.unsupportedProxies.push(`${tag || proxy.type} - ${reason}`);
+            // Reasons echo subscription values; a newline would escape the comment line
+            this.unsupportedProxies.push(`${tag || proxy.type} - ${reason}`.replace(/[\r\n]+/g, ' '));
             return null;
         }
     }
@@ -392,8 +406,7 @@ export class QuanxConfigBuilder extends BaseConfigBuilder {
     buildRemoteFilters(rules) {
         const lines = [];
         const usedTags = new Set();
-        const add = (url, id, outbound) => {
-            const policy = this.policyName(outbound);
+        const add = (url, id, policy) => {
             let tag = sanitizeQuanxName(`${id} - ${policy}`);
             for (let i = 2; usedTags.has(tag); i++) tag = sanitizeQuanxName(`${id} - ${policy} ${i}`);
             usedTags.add(tag);
@@ -401,25 +414,25 @@ export class QuanxConfigBuilder extends BaseConfigBuilder {
         };
         // Domain lists first so IP lists (which need DNS) are evaluated last
         rules.forEach(rule => (rule.site_rules || []).filter(Boolean).forEach(site => {
-            add(`${SURGE_SITE_RULE_SET_BASEURL}${site}.conf`, `geosite:${site}`, rule.outbound);
+            add(`${SURGE_SITE_RULE_SET_BASEURL}${site}.conf`, `geosite:${site}`, rule.policy);
         }));
         rules.forEach(rule => (rule.ip_rules || []).filter(Boolean).forEach(ip => {
-            add(`${SURGE_IP_RULE_SET_BASEURL}${ip}.txt`, `geoip:${ip}`, rule.outbound);
+            add(`${SURGE_IP_RULE_SET_BASEURL}${ip}.txt`, `geoip:${ip}`, rule.policy);
         }));
         return lines;
     }
 
     buildLocalFilters(rules) {
         const lines = [];
-        const push = (type, value, outbound) => {
+        const push = (type, value, policy) => {
             const str = typeof value === 'string' ? value.trim() : '';
             if (!str || /[,\s]/.test(str)) return;
-            lines.push(`${type}, ${str}, ${this.policyName(outbound)}`);
+            lines.push(`${type}, ${str}, ${policy}`);
         };
-        rules.forEach(rule => (rule.domain_suffix || []).forEach(v => push('host-suffix', v, rule.outbound)));
-        rules.forEach(rule => (rule.domain_keyword || []).forEach(v => push('host-keyword', v, rule.outbound)));
+        rules.forEach(rule => (rule.domain_suffix || []).forEach(v => push('host-suffix', v, rule.policy)));
+        rules.forEach(rule => (rule.domain_keyword || []).forEach(v => push('host-keyword', v, rule.policy)));
         rules.forEach(rule => (rule.ip_cidr || []).forEach(v => {
-            push(typeof v === 'string' && v.includes(':') ? 'ip6-cidr' : 'ip-cidr', v, rule.outbound);
+            push(typeof v === 'string' && v.includes(':') ? 'ip6-cidr' : 'ip-cidr', v, rule.policy);
         }));
         rules.forEach(rule => (rule.src_ip_cidr || []).forEach(v => {
             if (typeof v === 'string' && v.trim()) {
@@ -431,8 +444,14 @@ export class QuanxConfigBuilder extends BaseConfigBuilder {
     }
 
     formatConfig() {
-        // generateRules reverses customRules in place; formatConfig runs twice per request
-        const rules = generateRules(this.selectedRules, Array.isArray(this.customRules) ? [...this.customRules] : []);
+        const customRules = Array.isArray(this.customRules) ? this.customRules : [];
+        // Copy: generateRules reverses customRules in place and formatConfig runs twice per request.
+        // It prepends one entry per custom rule, so the first customRules.length entries are custom;
+        // their names are user-defined and must not go through i18n (policies are created the same way).
+        const rules = generateRules(this.selectedRules, [...customRules]).map((rule, index) => ({
+            ...rule,
+            policy: index < customRules.length ? sanitizeQuanxName(rule.outbound) : this.policyName(rule.outbound)
+        }));
         const general = this.config.general || {};
         const dns = Array.isArray(this.config.dns) ? this.config.dns : [];
 

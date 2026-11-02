@@ -7,7 +7,7 @@ const UUID = '23ad6b10-8d1a-40f7-8ad0-e3e35cd32291';
 
 const vmessWs = 'vmess://' + btoa(JSON.stringify({
     v: '2', ps: 'HK-vmess', add: 'hk.example.com', port: '443', id: UUID, aid: '0',
-    net: 'ws', type: 'none', host: 'cdn.example.com', path: '/ws', tls: 'tls', sni: 'hk.example.com'
+    net: 'ws', type: 'none', host: 'hk.example.com', path: '/ws', tls: 'tls', sni: 'hk.example.com'
 }));
 
 const INPUT = [
@@ -43,7 +43,7 @@ describe('QuanxConfigBuilder', () => {
         const servers = section(await build(), 'server_local');
 
         expect(servers).toContain('shadowsocks=1.2.3.4:8388, method=aes-256-gcm, password=pass, udp-relay=true, tag=JP-SS');
-        expect(servers).toContain(`vmess=hk.example.com:443, method=chacha20-poly1305, password=${UUID}, obfs=wss, obfs-host=cdn.example.com, obfs-uri=/ws, tls-host=hk.example.com, tls-verification=true, aead=true, udp-relay=true, tag=HK-vmess`);
+        expect(servers).toContain(`vmess=hk.example.com:443, method=chacha20-poly1305, password=${UUID}, obfs=wss, obfs-host=hk.example.com, obfs-uri=/ws, tls-verification=true, aead=true, udp-relay=true, tag=HK-vmess`);
         expect(servers).toContain(`vless=5.6.7.8:443, method=none, password=${UUID}, obfs=over-tls, obfs-host=www.apple.com, reality-base64-pubkey=PUBKEY, reality-hex-shortid=0123abcd, vless-flow=xtls-rprx-vision, udp-relay=true, tag=US-VLESS`);
         expect(servers).toContain('trojan=tj.example.com:443, password=pwd, over-tls=true, tls-host=tj.example.com, tls-verification=true, udp-relay=true, tag=SG，Trojan');
         expect(servers).toContain('anytls=at.example.com:443, password=pw, over-tls=true, tls-host=at.example.com, tls-verification=false, udp-relay=true, tag=JP-AnyTLS');
@@ -123,6 +123,71 @@ describe('QuanxConfigBuilder', () => {
         const ss2 = 'ss://' + btoa('aes-256-gcm:other') + '@1.2.3.4:8388#Same';
         const servers = section(await build([ss, ss, ss2].join('\n')), 'server_local');
         expect(servers.map(line => line.split('tag=').pop())).toEqual(['Same', 'Same 2']);
+    });
+
+    it('rejects wss nodes whose Host header differs from the TLS SNI', async () => {
+        const vmess = 'vmess://' + btoa(JSON.stringify({
+            v: '2', ps: 'Mismatch', add: 'a.example.com', port: '443', id: UUID, aid: '0',
+            net: 'ws', host: 'cdn.example.com', path: '/ws', tls: 'tls', sni: 'a.example.com'
+        }));
+        const trojan = 'trojan://pwd@t.example.com:443?sni=t.example.com&type=ws&host=cdn.example.com&path=%2Fws#TJ-Mismatch';
+        const config = await build([vmess, trojan].join('\n'));
+        expect(section(config, 'server_local')).toEqual([
+            '# Unsupported by Quantumult X: Mismatch - ws host differs from tls sni',
+            '# Unsupported by Quantumult X: TJ-Mismatch - ws host differs from tls sni'
+        ]);
+        expect(section(config, 'policy').join('\n')).not.toContain('Mismatch');
+    });
+
+    it('keeps untrusted multiline values from injecting config lines', async () => {
+        const input = JSON.stringify({
+            outbounds: [
+                { type: 'shadowsocks', tag: 'BadServer', server: 'a.com\n[mitm]', server_port: 1, method: 'aes-256-gcm', password: 'p' },
+                { type: 'shadowsocks', tag: 'BadMethod', server: 'b.com', server_port: 1, method: 'x\n[mitm]\nhostname = *', password: 'p' }
+            ]
+        });
+        const config = await build(input);
+        expect(config.match(/^\[mitm\]$/gm)).toHaveLength(1);
+        expect(config).not.toMatch(/^hostname/m);
+        expect(section(config, 'server_local')).toEqual([
+            '# Unsupported by Quantumult X: BadServer - server contains a delimiter',
+            '# Unsupported by Quantumult X: BadMethod - cipher x [mitm] hostname = *'
+        ]);
+    });
+
+    it('reads Sing-Box string plugin_opts', async () => {
+        const input = JSON.stringify({
+            outbounds: [
+                { type: 'shadowsocks', tag: 'V2P', server: 'v.com', server_port: 443, method: 'aes-256-gcm', password: 'p', plugin: 'v2ray-plugin', plugin_opts: 'mode=websocket;tls;host=cdn.example.com;path=/ws' },
+                { type: 'shadowsocks', tag: 'OBFS', server: 'o.com', server_port: 443, method: 'aes-256-gcm', password: 'p', plugin: 'obfs-local', plugin_opts: 'obfs=tls;obfs-host=bing.com' }
+            ]
+        });
+        const servers = section(await build(input), 'server_local');
+        expect(servers).toEqual([
+            'shadowsocks=v.com:443, method=aes-256-gcm, password=p, obfs=wss, obfs-host=cdn.example.com, obfs-uri=/ws, udp-relay=true, tag=V2P',
+            'shadowsocks=o.com:443, method=aes-256-gcm, password=p, obfs=tls, obfs-host=bing.com, udp-relay=true, tag=OBFS'
+        ]);
+    });
+
+    it('treats Clash trojan without a tls key as TLS', async () => {
+        const yaml = 'proxies:\n  - {name: CT, type: trojan, server: t.example.com, port: 443, password: p, sni: t.example.com}\n';
+        expect(section(await build(yaml), 'server_local')).toEqual([
+            'trojan=t.example.com:443, password=p, over-tls=true, tls-host=t.example.com, tls-verification=true, udp-relay=true, tag=CT'
+        ]);
+    });
+
+    it('references custom rule policies by their literal name', async () => {
+        const config = await build(INPUT, {
+            customRules: [
+                { name: 'Work.Proxy', domain_suffix: 'work.com', site: 'github' },
+                { name: 'Google', domain_suffix: 'g.com' }
+            ]
+        });
+        const policies = section(config, 'policy');
+        expect(policies.some(line => line.startsWith('static=Work.Proxy, '))).toBe(true);
+        expect(section(config, 'filter_local')).toContain('host-suffix, work.com, Work.Proxy');
+        expect(section(config, 'filter_local')).toContain('host-suffix, g.com, Google');
+        expect(section(config, 'filter_remote')[0]).toContain('force-policy=Work.Proxy,');
     });
 
     it('never yields an empty policy when no node is supported', async () => {
