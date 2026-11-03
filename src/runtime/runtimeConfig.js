@@ -13,6 +13,7 @@
  * @typedef {Object} RuntimeConfig
  * @property {number} [configTtlSeconds]
  * @property {number} [shortLinkTtlSeconds]
+ * @property {string} [accessToken] - optional shared secret; unset keeps every route open
  */
 
 /**
@@ -33,6 +34,11 @@ const DEFAULTS = {
  * @param {RuntimeBindings | undefined} runtime
  * @returns {{ kv: KeyValueStore | null, assetFetcher: AssetFetcher | null, logger: Console, config: RuntimeConfig & { configTtlSeconds: number, shortLinkTtlSeconds: number | null } }}
  */
+// Blank values count as "not configured" so an empty env var never locks the app
+function normalizeToken(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 export function normalizeRuntime(runtime = {}) {
     return {
         kv: runtime.kv ?? null,
@@ -40,7 +46,8 @@ export function normalizeRuntime(runtime = {}) {
         logger: runtime.logger ?? console,
         config: {
             configTtlSeconds: runtime.config?.configTtlSeconds ?? DEFAULTS.configTtlSeconds,
-            shortLinkTtlSeconds: runtime.config?.shortLinkTtlSeconds ?? null
+            shortLinkTtlSeconds: runtime.config?.shortLinkTtlSeconds ?? null,
+            accessToken: normalizeToken(runtime.config?.accessToken)
         }
     };
 }

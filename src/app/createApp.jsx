@@ -17,6 +17,7 @@ import { ShortLinkService } from '../services/shortLinkService.js';
 import { ConfigStorageService } from '../services/configStorageService.js';
 import { ServiceError, MissingDependencyError } from '../services/errors.js';
 import { normalizeRuntime } from '../runtime/runtimeConfig.js';
+import { createAccessGuard } from './accessGuard.js';
 import { PREDEFINED_RULE_SETS, SING_BOX_CONFIG, SING_BOX_CONFIG_V1_11, generateSubconverterConfig } from '../config/index.js';
 
 const DEFAULT_USER_AGENT = 'curl/7.74.0';
@@ -39,6 +40,12 @@ export function createApp(bindings = {}) {
         await next();
     });
 
+    // Converting (which fetches arbitrary URLs) and writing to KV need the token when one is set.
+    // Short-link redirects stay public: the stored target already carries the token, and
+    // subscription clients must be able to follow them.
+    const requireAccess = createAccessGuard(runtime.config.accessToken);
+    ['/singbox', '/clash', '/surge', '/quanx', '/xray', '/shorten-v2', '/config'].forEach(path => app.use(path, requireAccess));
+
     app.get('/', (c) => {
         const t = c.get('t');
         const lang = resolveLanguage(c.get('lang'));
@@ -59,7 +66,7 @@ export function createApp(bindings = {}) {
                                         {subtitle}
                                     </p>
                                 </div>
-                                <Form t={t} lang={lang} />
+                                <Form t={t} lang={lang} accessRequired={!!runtime.config.accessToken} />
                             </div>
                         </div>
                     </main>

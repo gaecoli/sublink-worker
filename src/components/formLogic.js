@@ -99,6 +99,7 @@ export const formLogicFn = (t) => {
             configValidationState: '',
             configValidationMessage: '',
             customUA: '',
+            accessToken: '',
             loading: false,
             generatedLinks: null,
             shortenedLinks: null,
@@ -136,6 +137,7 @@ export const formLogicFn = (t) => {
                 this.externalController = localStorage.getItem('externalController') || '';
                 this.externalUiDownloadUrl = localStorage.getItem('externalUiDownloadUrl') || '';
                 this.customUA = localStorage.getItem('userAgent') || '';
+                this.accessToken = localStorage.getItem('accessToken') || '';
                 this.configEditor = localStorage.getItem('configEditor') || '';
                 this.configType = localStorage.getItem('configType') || 'singbox';
                 this.customShortCode = localStorage.getItem('customShortCode') || '';
@@ -167,6 +169,7 @@ export const formLogicFn = (t) => {
                 this.$watch('externalController', val => localStorage.setItem('externalController', val));
                 this.$watch('externalUiDownloadUrl', val => localStorage.setItem('externalUiDownloadUrl', val));
                 this.$watch('customUA', val => localStorage.setItem('userAgent', val));
+                this.$watch('accessToken', val => localStorage.setItem('accessToken', val));
                 this.$watch('configEditor', val => {
                     localStorage.setItem('configEditor', val);
                     this.resetConfigValidation();
@@ -239,6 +242,10 @@ export const formLogicFn = (t) => {
                 }).catch(() => {});
             },
 
+            authHeaders() {
+                return this.accessToken ? { 'X-Access-Token': this.accessToken } : {};
+            },
+
             resetConfigValidation() {
                 this.configValidationState = '';
                 this.configValidationMessage = '';
@@ -268,7 +275,8 @@ export const formLogicFn = (t) => {
                     const response = await fetch('/config', {
                         method: 'POST',
                         headers: {
-                            'Content-Type': 'application/json'
+                            'Content-Type': 'application/json',
+                            ...this.authHeaders()
                         },
                         body: JSON.stringify({
                             type: this.configType,
@@ -383,6 +391,8 @@ export const formLogicFn = (t) => {
                     const params = new URLSearchParams();
                     params.append('config', this.input);
                     params.append('ua', this.customUA);
+                    // Subscription clients cannot send headers, so the token rides in the link
+                    if (this.accessToken) params.append('token', this.accessToken);
                     params.append('selectedRules', JSON.stringify(this.selectedRules));
                     params.append('customRules', JSON.stringify(customRules));
 
@@ -456,7 +466,11 @@ export const formLogicFn = (t) => {
                                 apiUrl += `&shortCode=${encodeURIComponent(shortCode)}`;
                             }
 
-                            const response = await fetch(apiUrl);
+                            const response = await fetch(apiUrl, { headers: this.authHeaders() });
+                            if (response.status === 401) {
+                                alert(window.APP_TRANSLATIONS.accessTokenInvalid);
+                                return;
+                            }
                             if (!response.ok) {
                                 throw new Error(`Failed to shorten ${type} link`);
                             }
@@ -647,6 +661,11 @@ export const formLogicFn = (t) => {
                 const ua = params.get('ua');
                 if (ua) {
                     this.customUA = ua;
+                }
+
+                const token = params.get('token');
+                if (token) {
+                    this.accessToken = token;
                 }
 
                 const configId = params.get('configId');

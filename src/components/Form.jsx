@@ -15,7 +15,7 @@ const LINK_FIELDS = [
 ];
 
 export const Form = (props) => {
-  const { t, lang } = props;
+  const { t, lang, accessRequired = false } = props;
 
   const translations = {
     processing: t('processing'),
@@ -35,13 +35,15 @@ export const Form = (props) => {
     customShortCode: t('customShortCode'),
     optional: t('optional'),
     customShortCodePlaceholder: t('customShortCodePlaceholder'),
-    showFullLinks: t('showFullLinks')
+    showFullLinks: t('showFullLinks'),
+    accessTokenInvalid: t('accessTokenInvalid')
   };
 
   const scriptContent = `
     window.APP_TRANSLATIONS = ${JSON.stringify(translations)};
     window.PREDEFINED_RULE_SETS = ${JSON.stringify(PREDEFINED_RULE_SETS)};
     window.APP_LANG = ${JSON.stringify(lang || 'zh-CN')};
+    window.APP_ACCESS_REQUIRED = ${JSON.stringify(!!accessRequired)};
     if (typeof __name === 'undefined') { var __name = function(fn) { return fn; }; }
     (${formLogicFn.toString()})();
   `;
@@ -319,6 +321,25 @@ export const Form = (props) => {
               placeholder="curl/7.74.0" 
             />
           </div>
+
+  {/* Access token: only rendered when the server has ACCESS_TOKEN set, so open deployments look unchanged */ }
+  {accessRequired && (
+          <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-sm border border-gray-200 dark:border-gray-700 p-6">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+              <i class="fas fa-key text-gray-400"></i>
+              {t('accessToken')}
+            </h3>
+            <input
+              type="password"
+              id="accessToken"
+              x-model="accessToken"
+              autocomplete="off"
+              class="w-full px-4 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+              placeholder={t('accessTokenPlaceholder')}
+            />
+            <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{t('accessTokenTip')}</p>
+          </div>
+  )}
         </div>
 
   {/* Action Buttons */ }

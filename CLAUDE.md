@@ -43,7 +43,9 @@ Sublink Worker 是多平台代理订阅转换器：将各类协议（ShadowSocks
 - Node/Vercel 优先级：Redis > Upstash/Vercel KV > 内存兜底；`DISABLE_MEMORY_KV=true` 关闭兜底
 - Cloudflare 用 `wrangler.toml` 的 `SUBLINK_KV` 与 `ASSETS` binding
 
-环境变量：`REDIS_URL` / `REDIS_HOST`+`REDIS_PORT` / `REDIS_USERNAME` / `REDIS_PASSWORD` / `REDIS_TLS` / `REDIS_KEY_PREFIX`、`KV_REST_API_URL`+`KV_REST_API_TOKEN`、`CONFIG_TTL_SECONDS`、`SHORT_LINK_TTL_SECONDS`、`STATIC_DIR`、`PORT`。
+环境变量：`REDIS_URL` / `REDIS_HOST`+`REDIS_PORT` / `REDIS_USERNAME` / `REDIS_PASSWORD` / `REDIS_TLS` / `REDIS_KEY_PREFIX`、`KV_REST_API_URL`+`KV_REST_API_TOKEN`、`CONFIG_TTL_SECONDS`、`SHORT_LINK_TTL_SECONDS`、`STATIC_DIR`、`PORT`、`ACCESS_TOKEN`。
+
+**访问密钥（可选）**：设置 `ACCESS_TOKEN`（Cloudflare 用 Worker secret）后，转换接口（`/singbox` `/clash` `/surge` `/quanx` `/xray`）与写入接口（`/shorten-v2` `/config`）需 `?token=` 或 `X-Access-Token`（`src/app/accessGuard.js`）；短链跳转保持公开（目标链接已带 token）；前端仅在开启时显示密钥输入框，密钥只存浏览器 localStorage。未设置时行为完全不变。
 
 ## 协议解析与配置构建
 
